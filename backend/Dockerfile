@@ -3,7 +3,7 @@ WORKDIR /workspace
 COPY --chown=gradle:gradle build.gradle.kts settings.gradle.kts ./
 RUN gradle dependencies --no-daemon
 COPY --chown=gradle:gradle src src
-RUN gradle build --no-daemon
+RUN gradle clean bootJar --no-daemon --no-build-cache
 
 FROM eclipse-temurin:21-jre-alpine
 WORKDIR /app

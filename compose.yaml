@@ -21,5 +21,26 @@ services:
       - "1025:1025"
       - "8025:8025"
 
+   #Uncomment this service to build and run the backend entirely through Docker Compose.
+  backend:
+   build:
+     context: ./backend
+   environment:
+     DB_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:-provision}
+     DB_USERNAME: ${POSTGRES_USER:-provision}
+     DB_PASSWORD: ${POSTGRES_PASSWORD:-provision}
+     MAIL_HOST: mailpit
+     MAIL_PORT: 1025
+     MAX_UPLOAD_FILE_SIZE: ${MAX_UPLOAD_FILE_SIZE:-50MB}
+     MAX_UPLOAD_REQUEST_SIZE: ${MAX_UPLOAD_REQUEST_SIZE:-55MB}
+   ports:
+     - "8080:8080"
+   depends_on:
+     postgres:
+       condition: service_healthy
+     mailpit:
+       condition: service_started
+   restart: unless-stopped
+
 volumes:
   postgres-data:

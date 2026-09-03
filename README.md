@@ -23,6 +23,13 @@ cd backend
 ./gradlew bootRun
 ```
 
+Чтобы не устанавливать Java/Gradle и запустить backend с нуля только через Docker,
+раскомментируйте сервис `backend` в `compose.yaml` и запустите:
+
+```bash
+docker compose up -d --build
+```
+
 И frontend в отдельном терминале (Node.js 20.19+):
 
 ```bash
