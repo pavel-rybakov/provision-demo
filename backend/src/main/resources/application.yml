@@ -11,11 +11,16 @@ spring:
     properties:
       hibernate:
         jdbc:
-          batch_size: 50
+          batch_size: 100
         order_inserts: true
     open-in-view: false
   flyway:
     enabled: true
+  servlet:
+    multipart:
+      max-file-size: ${MAX_UPLOAD_FILE_SIZE:50MB}
+      # Keep this slightly above max-file-size to allow for multipart headers.
+      max-request-size: ${MAX_UPLOAD_REQUEST_SIZE:55MB}
   mail:
     host: ${MAIL_HOST:localhost}
     port: ${MAIL_PORT:1025}

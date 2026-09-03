@@ -9,6 +9,7 @@ import com.provision.backend.meterreadings.MeterReading;
 import com.provision.backend.meterreadings.MeterReadingRepository;
 import com.provision.backend.meterreadings.MeterReadingSourceType;
 import com.provision.backend.readingimports.api.ReadingImportResponse;
+import jakarta.persistence.EntityManager;
 import lombok.RequiredArgsConstructor;
 import org.apache.commons.csv.CSVFormat;
 import org.apache.commons.csv.CSVParser;
@@ -17,7 +18,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.multipart.MultipartFile;
 
-import java.io.ByteArrayInputStream;
+import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
@@ -31,10 +32,12 @@ import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.stream.Stream;
 
 @Service
 @RequiredArgsConstructor
 public class ReadingImportService {
+    private static final int BATCH_SIZE = 100;
     private static final List<String> HEADERS = List.of(
             "meter_serial_number", "measured_at", "zone_t1", "zone_t2", "zone_t3");
 
@@ -43,11 +46,11 @@ public class ReadingImportService {
     private final AccountRepository accountRepository;
     private final ElectricityMeterRepository meterRepository;
     private final MeterReadingRepository readingRepository;
+    private final EntityManager entityManager;
 
     @Transactional
-    public ReadingImportResponse upload(MultipartFile file, UUID currentAccountId) {
-        byte[] content = read(file);
-        String hash = sha256(content);
+    public ReadingImportResponse importReadings(MultipartFile file, UUID currentAccountId) {
+        String hash = sha256(file);
         if (importRepository.existsByFileHash(hash)) {
             throw new ReadingImportException("Этот CSV-файл уже был загружен");
         }
@@ -59,99 +62,107 @@ public class ReadingImportService {
                 new ReadingImport(Optional.ofNullable(file.getOriginalFilename()).orElse("readings.csv"), hash, uploader)
         );
 
-        List<ReadingImportRow> rows = parse(content, readingImport);
-        readingImport.setTotalRows(rows.size());
-        rowRepository.saveAll(rows);
-        return ReadingImportResponse.from(readingImport, rows);
+        parseValidateAndSave(file, readingImport);
+        if (readingImport.getStatus() == ReadingImportStatus.READY) {
+            apply(readingImport);
+        }
+        importRepository.save(readingImport);
+        return ReadingImportResponse.from(readingImport);
     }
 
-    @Transactional
-    public ReadingImportResponse validate(UUID id) {
-        ReadingImport readingImport = get(id);
-        if (readingImport.getStatus() == ReadingImportStatus.APPLIED) {
-            throw new ReadingImportException("Применённый импорт нельзя проверить повторно");
-        }
-        List<ReadingImportRow> rows = rows(id);
+    private void parseValidateAndSave(MultipartFile file, ReadingImport readingImport) {
         Set<String> keys = new HashSet<>();
+        List<ReadingImportRow> batch = new ArrayList<>(BATCH_SIZE);
+        int total = 0;
         int valid = 0;
-        for (ReadingImportRow row : rows) {
-            String error = row.getValidationError();
-            Optional<ElectricityMeter> meter = meterRepository.findBySerialNumber(row.getMeterSerialNumber());
-            if (meter.isEmpty()) error = append(error, "Прибор с таким серийным номером не найден");
-            else {
-                row.setElectricityMeter(meter.get());
-                String key = meter.get().getId() + "|" + row.getMeasuredAt();
-                if (!keys.add(key)) error = append(error, "Дубликат прибора и времени внутри файла");
-                if (row.getMeasuredAt() != null && readingRepository
-                        .existsByElectricityMeterIdAndMeasuredAt(meter.get().getId(), row.getMeasuredAt())) {
-                    error = append(error, "Показание с таким временем уже существует");
-                }
-            }
-            row.setValidationError(error);
-            if (error == null) valid++;
-        }
-        readingImport.setValidRows(valid);
-        readingImport.setInvalidRows(rows.size() - valid);
-        readingImport.setValidatedAt(Instant.now());
-        readingImport.setStatus(valid == rows.size() && !rows.isEmpty()
-                ? ReadingImportStatus.READY : ReadingImportStatus.INVALID);
-        return ReadingImportResponse.from(readingImport, rows);
-    }
-
-    @Transactional(readOnly = true)
-    public ReadingImportResponse findById(UUID id) {
-        return ReadingImportResponse.from(get(id), rows(id));
-    }
-
-    @Transactional
-    public ReadingImportResponse apply(UUID id) {
-        ReadingImport readingImport = importRepository.findByIdForUpdate(id)
-                .orElseThrow(() -> new ReadingImportException("Импорт не найден"));
-        if (readingImport.getStatus() != ReadingImportStatus.READY) {
-            throw new ReadingImportException("Применить можно только импорт в статусе READY");
-        }
-        List<ReadingImportRow> rows = rows(id);
-        List<UUID> meterIds = rows.stream().map(row -> row.getElectricityMeter().getId()).distinct().sorted().toList();
-        meterRepository.findAllByIdForUpdate(meterIds);
-
-        for (ReadingImportRow row : rows) {
-            if (readingRepository.existsByElectricityMeterIdAndMeasuredAt(
-                    row.getElectricityMeter().getId(), row.getMeasuredAt())) {
-                throw new ReadingImportException("После проверки появились конфликтующие показания; проверьте импорт снова");
-            }
-        }
-        List<MeterReading> readings = rows.stream().map(row -> {
-            MeterReading reading = new MeterReading(row.getElectricityMeter(), row.getMeasuredAt(),
-                    row.getZoneT1(), MeterReadingSourceType.CSV);
-            reading.setZoneT2(row.getZoneT2());
-            reading.setZoneT3(row.getZoneT3());
-            return reading;
-        }).toList();
-        readingRepository.saveAllAndFlush(readings);
-        readingImport.setStatus(ReadingImportStatus.APPLIED);
-        readingImport.setAppliedAt(Instant.now());
-        return ReadingImportResponse.from(readingImport, rows);
-    }
-
-    private List<ReadingImportRow> parse(byte[] content, ReadingImport readingImport) {
-        try (InputStreamReader reader = new InputStreamReader(
-                new ByteArrayInputStream(content), StandardCharsets.UTF_8)) {
+        try (InputStreamReader reader = new InputStreamReader(file.getInputStream(), StandardCharsets.UTF_8)) {
             CSVFormat format = CSVFormat.DEFAULT.builder().setHeader().setSkipHeaderRecord(true).get();
             try (CSVParser parser = format.parse(reader)) {
                 if (!parser.getHeaderNames().equals(HEADERS)) {
                     throw new ReadingImportException("Ожидаются колонки: " + String.join(",", HEADERS));
                 }
-                List<ReadingImportRow> result = new ArrayList<>();
                 for (CSVRecord record : parser) {
-                    result.add(parseRow(readingImport, record));
+                    ReadingImportRow row = parseRow(readingImport, record);
+                    if (validate(row, keys)) {
+                        valid++;
+                    }
+                    total++;
+                    batch.add(row);
+                    if (batch.size() == BATCH_SIZE) {
+                        saveRowBatch(batch);
+                    }
                 }
-                return result;
+                saveRowBatch(batch);
             }
         } catch (ReadingImportException exception) {
             throw exception;
         } catch (Exception exception) {
             throw new ReadingImportException("Не удалось прочитать CSV-файл", exception);
         }
+        readingImport.setTotalRows(total);
+        readingImport.setValidRows(valid);
+        readingImport.setInvalidRows(total - valid);
+        readingImport.setValidatedAt(Instant.now());
+        readingImport.setStatus(valid == total && total > 0
+                ? ReadingImportStatus.READY : ReadingImportStatus.INVALID);
+    }
+
+    private boolean validate(ReadingImportRow row, Set<String> keys) {
+        String error = row.getValidationError();
+        Optional<ElectricityMeter> meter = meterRepository.findBySerialNumber(row.getMeterSerialNumber());
+        if (meter.isEmpty()) {
+            error = append(error, "Прибор с таким серийным номером не найден");
+        } else {
+            row.setElectricityMeter(meter.get());
+            String key = meter.get().getId() + "|" + row.getMeasuredAt();
+            if (!keys.add(key)) {
+                error = append(error, "Дубликат прибора и времени внутри файла");
+            }
+        }
+        row.setValidationError(error);
+        return error == null;
+    }
+
+    private void saveRowBatch(List<ReadingImportRow> batch) {
+        if (batch.isEmpty()) {
+            return;
+        }
+        rowRepository.saveAllAndFlush(batch);
+        entityManager.clear();
+        batch.clear();
+    }
+
+    @Transactional(readOnly = true)
+    public ReadingImportResponse findById(UUID id) {
+        return ReadingImportResponse.from(get(id));
+    }
+
+    private void apply(ReadingImport readingImport) {
+        List<MeterReading> batch = new ArrayList<>(BATCH_SIZE);
+        try (Stream<ReadingImportRow> rows = rowRepository.streamAllByImportId(readingImport.getId())) {
+            rows.forEach(row -> {
+                MeterReading reading = new MeterReading(row.getElectricityMeter(), row.getMeasuredAt(),
+                        row.getZoneT1(), MeterReadingSourceType.CSV);
+                reading.setZoneT2(row.getZoneT2());
+                reading.setZoneT3(row.getZoneT3());
+                batch.add(reading);
+                if (batch.size() == BATCH_SIZE) {
+                    saveReadingBatch(batch);
+                }
+            });
+        }
+        saveReadingBatch(batch);
+        readingImport.setStatus(ReadingImportStatus.APPLIED);
+        readingImport.setAppliedAt(Instant.now());
+    }
+
+    private void saveReadingBatch(List<MeterReading> batch) {
+        if (batch.isEmpty()) {
+            return;
+        }
+        readingRepository.saveAllAndFlush(batch);
+        entityManager.clear();
+        batch.clear();
     }
 
     private ReadingImportRow parseRow(ReadingImport readingImport, CSVRecord record) {
@@ -205,7 +216,9 @@ public class ReadingImportService {
     private BigDecimal decimal(String value, boolean required) {
         String trimmed = value.trim();
         if (trimmed.isEmpty()) {
-            if (required) throw new NumberFormatException();
+            if (required) {
+                throw new NumberFormatException();
+            }
             return null;
         }
         return new BigDecimal(trimmed);
@@ -215,17 +228,16 @@ public class ReadingImportService {
         return importRepository.findById(id).orElseThrow(() -> new ReadingImportException("Импорт не найден"));
     }
 
-    private List<ReadingImportRow> rows(UUID id) { return rowRepository.findAllByReadingImportIdOrderByRowNumber(id); }
-
     private String append(String current, String next) { return current == null ? next : current + "; " + next; }
 
-    private byte[] read(MultipartFile file) {
-        try { return file.getBytes(); }
-        catch (Exception e) { throw new ReadingImportException("Не удалось прочитать загруженный файл", e); }
-    }
-
-    private String sha256(byte[] content) {
-        try { return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(content)); }
-        catch (Exception e) { throw new IllegalStateException(e); }
+    private String sha256(MultipartFile file) {
+        try (InputStream input = file.getInputStream()) {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            byte[] buffer = new byte[8192];
+            for (int read; (read = input.read(buffer)) != -1;) digest.update(buffer, 0, read);
+            return HexFormat.of().formatHex(digest.digest());
+        } catch (Exception e) {
+            throw new ReadingImportException("Не удалось прочитать загруженный файл", e);
+        }
     }
 }

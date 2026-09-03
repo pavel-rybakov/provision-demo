@@ -41,3 +41,6 @@ npm run dev
 - Mailpit UI: `http://localhost:8025`
 
 Переменные окружения перечислены в `.env.example`. Не добавляйте рабочий `.env` в Git.
+
+Максимальный размер загружаемого CSV по умолчанию — 50 MB. Его можно изменить через
+`MAX_UPLOAD_FILE_SIZE`; `MAX_UPLOAD_REQUEST_SIZE` должен быть немного больше, чтобы учесть multipart-заголовки.
