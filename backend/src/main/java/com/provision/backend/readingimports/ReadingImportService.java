@@ -3,17 +3,13 @@ package com.provision.backend.readingimports;
 import com.provision.backend.account.Account;
 import com.provision.backend.account.AccountNotFoundException;
 import com.provision.backend.account.AccountRepository;
-import com.provision.backend.meter.ElectricityMeter;
-import com.provision.backend.meter.ElectricityMeterRepository;
-import com.provision.backend.meterreadings.MeterReading;
-import com.provision.backend.meterreadings.MeterReadingRepository;
-import com.provision.backend.meterreadings.MeterReadingSourceType;
 import com.provision.backend.readingimports.api.ReadingImportResponse;
 import jakarta.persistence.EntityManager;
 import lombok.RequiredArgsConstructor;
 import org.apache.commons.csv.CSVFormat;
 import org.apache.commons.csv.CSVParser;
 import org.apache.commons.csv.CSVRecord;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.multipart.MultipartFile;
@@ -26,13 +22,10 @@ import java.security.MessageDigest;
 import java.time.Instant;
 import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
-import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Optional;
-import java.util.Set;
 import java.util.UUID;
-import java.util.stream.Stream;
 
 @Service
 @RequiredArgsConstructor
@@ -44,9 +37,8 @@ public class ReadingImportService {
     private final ReadingImportRepository importRepository;
     private final ReadingImportRowRepository rowRepository;
     private final AccountRepository accountRepository;
-    private final ElectricityMeterRepository meterRepository;
-    private final MeterReadingRepository readingRepository;
     private final EntityManager entityManager;
+    private final ApplicationEventPublisher eventPublisher;
 
     @Transactional
     public ReadingImportResponse importReadings(MultipartFile file, UUID currentAccountId) {
@@ -62,19 +54,15 @@ public class ReadingImportService {
                 new ReadingImport(Optional.ofNullable(file.getOriginalFilename()).orElse("readings.csv"), hash, uploader)
         );
 
-        parseValidateAndSave(file, readingImport);
-        if (readingImport.getStatus() == ReadingImportStatus.READY) {
-            apply(readingImport);
-        }
+        parseAndSave(file, readingImport);
         importRepository.save(readingImport);
+        eventPublisher.publishEvent(new ReadingImportUploadedEvent(readingImport.getId()));
         return ReadingImportResponse.from(readingImport);
     }
 
-    private void parseValidateAndSave(MultipartFile file, ReadingImport readingImport) {
-        Set<String> keys = new HashSet<>();
+    private void parseAndSave(MultipartFile file, ReadingImport readingImport) {
         List<ReadingImportRow> batch = new ArrayList<>(BATCH_SIZE);
         int total = 0;
-        int valid = 0;
         try (InputStreamReader reader = new InputStreamReader(file.getInputStream(), StandardCharsets.UTF_8)) {
             CSVFormat format = CSVFormat.DEFAULT.builder().setHeader().setSkipHeaderRecord(true).get();
             try (CSVParser parser = format.parse(reader)) {
@@ -83,9 +71,6 @@ public class ReadingImportService {
                 }
                 for (CSVRecord record : parser) {
                     ReadingImportRow row = parseRow(readingImport, record);
-                    if (validate(row, keys)) {
-                        valid++;
-                    }
                     total++;
                     batch.add(row);
                     if (batch.size() == BATCH_SIZE) {
@@ -100,27 +85,6 @@ public class ReadingImportService {
             throw new ReadingImportException("Не удалось прочитать CSV-файл", exception);
         }
         readingImport.setTotalRows(total);
-        readingImport.setValidRows(valid);
-        readingImport.setInvalidRows(total - valid);
-        readingImport.setValidatedAt(Instant.now());
-        readingImport.setStatus(valid == total && total > 0
-                ? ReadingImportStatus.READY : ReadingImportStatus.INVALID);
-    }
-
-    private boolean validate(ReadingImportRow row, Set<String> keys) {
-        String error = row.getValidationError();
-        Optional<ElectricityMeter> meter = meterRepository.findBySerialNumber(row.getMeterSerialNumber());
-        if (meter.isEmpty()) {
-            error = append(error, "Прибор с таким серийным номером не найден");
-        } else {
-            row.setElectricityMeter(meter.get());
-            String key = meter.get().getId() + "|" + row.getMeasuredAt();
-            if (!keys.add(key)) {
-                error = append(error, "Дубликат прибора и времени внутри файла");
-            }
-        }
-        row.setValidationError(error);
-        return error == null;
     }
 
     private void saveRowBatch(List<ReadingImportRow> batch) {
@@ -135,34 +99,6 @@ public class ReadingImportService {
     @Transactional(readOnly = true)
     public ReadingImportResponse findById(UUID id) {
         return ReadingImportResponse.from(get(id));
-    }
-
-    private void apply(ReadingImport readingImport) {
-        List<MeterReading> batch = new ArrayList<>(BATCH_SIZE);
-        try (Stream<ReadingImportRow> rows = rowRepository.streamAllByImportId(readingImport.getId())) {
-            rows.forEach(row -> {
-                MeterReading reading = new MeterReading(row.getElectricityMeter(), row.getMeasuredAt(),
-                        row.getZoneT1(), MeterReadingSourceType.CSV);
-                reading.setZoneT2(row.getZoneT2());
-                reading.setZoneT3(row.getZoneT3());
-                batch.add(reading);
-                if (batch.size() == BATCH_SIZE) {
-                    saveReadingBatch(batch);
-                }
-            });
-        }
-        saveReadingBatch(batch);
-        readingImport.setStatus(ReadingImportStatus.APPLIED);
-        readingImport.setAppliedAt(Instant.now());
-    }
-
-    private void saveReadingBatch(List<MeterReading> batch) {
-        if (batch.isEmpty()) {
-            return;
-        }
-        readingRepository.saveAllAndFlush(batch);
-        entityManager.clear();
-        batch.clear();
     }
 
     private ReadingImportRow parseRow(ReadingImport readingImport, CSVRecord record) {

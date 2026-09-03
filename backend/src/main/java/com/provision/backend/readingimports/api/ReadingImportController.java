@@ -37,8 +37,8 @@ public class ReadingImportController {
     private final DebugReadingImportCsvGenerator debugCsvGenerator;
 
     @PostMapping(consumes = "multipart/form-data")
-    @ResponseStatus(HttpStatus.CREATED)
-    @Operation(summary = "Загрузить, проверить и применить CSV-файл")
+    @ResponseStatus(HttpStatus.ACCEPTED)
+    @Operation(summary = "Загрузить CSV-файл и запустить его фоновую обработку")
     public ReadingImportResponse importReadings(@RequestPart("file") MultipartFile file,
                                                 BearerTokenAuthentication authentication) {
         return service.importReadings(

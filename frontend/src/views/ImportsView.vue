@@ -1,13 +1,41 @@
 <script setup>
-import { ref } from 'vue'
+import { onBeforeUnmount, ref } from 'vue'
 import { api, apiJson } from '../api'
-import { errorMessage, formatDate } from '../utils'
+import { errorMessage, formatDate, formatDuration } from '../utils'
 import PageHeader from '../components/PageHeader.vue'
 import StatusMessage from '../components/StatusMessage.vue'
 
 const file = ref(null); const current = ref(null); const lookupId = ref(''); const error = ref(''); const success = ref(''); const loading = ref(false)
 const debugRowCount = ref(100)
+let pollTimer
+const terminalStatuses = new Set(['APPLIED', 'INVALID', 'FAILED'])
 function choose(event) { file.value = event.target.files[0] }
+function processingEnd(value) {
+  if (value.appliedAt) return value.appliedAt
+  if (value.status === 'INVALID') return value.validatedAt
+  if (!terminalStatuses.has(value.status)) return new Date().toISOString()
+  return null
+}
+function pollImport(id) {
+  clearTimeout(pollTimer)
+  pollTimer = setTimeout(async () => {
+    try {
+      current.value = await apiJson(`/admin/reading-imports/${id}`)
+      if (terminalStatuses.has(current.value.status)) {
+        success.value = current.value.status === 'APPLIED'
+          ? 'CSV проверен и импортирован'
+          : current.value.status === 'INVALID'
+            ? `CSV проверен: найдено ошибок — ${current.value.invalidRows}`
+            : 'Не удалось обработать CSV'
+        return
+      }
+      pollImport(id)
+    } catch (e) {
+      error.value = errorMessage(e)
+    }
+  }, 1000)
+}
+onBeforeUnmount(() => clearTimeout(pollTimer))
 async function importFile() {
   if (!file.value) return
   loading.value = true; error.value = ''; success.value = ''
@@ -16,9 +44,8 @@ async function importFile() {
     body.append('file', file.value)
     current.value = await apiJson('/admin/reading-imports', { method: 'POST', body })
     lookupId.value = current.value.id
-    success.value = current.value.status === 'APPLIED'
-      ? 'CSV проверен и импортирован'
-      : `CSV проверен: найдено ошибок — ${current.value.invalidRows}`
+    success.value = 'CSV загружен и передан на фоновую обработку'
+    pollImport(current.value.id)
   }
   catch (e) { error.value = errorMessage(e) } finally { loading.value = false }
 }
@@ -60,6 +87,14 @@ async function downloadDebugCsv() {
   </section>
   <section v-if="current" class="panel">
     <div class="summary"><div><small>Статус</small><strong>{{ current.status }}</strong></div><div><small>Всего</small><strong>{{ current.totalRows }}</strong></div><div><small>Корректно</small><strong>{{ current.validRows }}</strong></div><div><small>Ошибок</small><strong>{{ current.invalidRows }}</strong></div></div>
-    <p class="hint">{{ current.originalFilename }} · {{ formatDate(current.createdAt) }}</p>
+    <div class="import-details">
+      <div><small>Загружен</small><span>{{ formatDate(current.createdAt) }}</span></div>
+      <div><small>Проверен</small><span>{{ formatDate(current.validatedAt) }}</span></div>
+      <div><small>Применён</small><span>{{ formatDate(current.appliedAt) }}</span></div>
+    </div>
+    <p class="import-meta">
+      <span>{{ current.originalFilename }}</span>
+      <small>Обработка: {{ formatDuration(current.createdAt, processingEnd(current)) }}</small>
+    </p>
   </section>
 </template>

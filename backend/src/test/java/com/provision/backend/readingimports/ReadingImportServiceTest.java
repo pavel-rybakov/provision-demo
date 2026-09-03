@@ -15,6 +15,7 @@ import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.mock.web.MockMultipartFile;
+import org.springframework.context.ApplicationEventPublisher;
 
 import java.math.BigDecimal;
 import java.time.Instant;
@@ -37,51 +38,44 @@ class ReadingImportServiceTest {
     @Mock ElectricityMeterRepository meterRepository;
     @Mock MeterReadingRepository readingRepository;
     @Mock EntityManager entityManager;
+    @Mock ApplicationEventPublisher eventPublisher;
     @InjectMocks ReadingImportService service;
 
     @Test
-    void uploadsValidatesAndAppliesCsvInOneCall() {
+    void uploadsAndSavesRowsBeforePublishingProcessingEvent() {
         UUID accountId = UUID.randomUUID();
         MockMultipartFile file = new MockMultipartFile("file", "readings.csv", "text/csv", (
                 "meter_serial_number,measured_at,zone_t1,zone_t2,zone_t3\n" +
                 "SN-1,2026-09-03T06:00:00Z,100.5,50.1,\n").getBytes());
-        ElectricityMeter meter = mock(ElectricityMeter.class);
-        UUID meterId = UUID.randomUUID();
-        when(meter.getId()).thenReturn(meterId);
         when(accountRepository.findById(accountId)).thenReturn(Optional.of(account()));
         when(importRepository.save(any())).thenAnswer(invocation -> invocation.getArgument(0));
-        when(meterRepository.findBySerialNumber("SN-1")).thenReturn(Optional.of(meter));
-        when(rowRepository.streamAllByImportId(org.mockito.ArgumentMatchers.nullable(UUID.class))).thenAnswer(invocation ->
-                java.util.stream.Stream.of(row(readingImport(), meter)));
 
         ReadingImportResponse response = service.importReadings(file, accountId);
 
-        assertThat(response.status()).isEqualTo(ReadingImportStatus.APPLIED);
+        assertThat(response.status()).isEqualTo(ReadingImportStatus.UPLOADED);
         assertThat(response.totalRows()).isEqualTo(1);
-        assertThat(response.validRows()).isEqualTo(1);
+        assertThat(response.validRows()).isZero();
         assertThat(response.fileHash()).hasSize(64);
         verify(rowRepository).saveAllAndFlush(any());
-        verify(readingRepository).saveAllAndFlush(any());
+        verify(eventPublisher).publishEvent(any(ReadingImportUploadedEvent.class));
     }
 
     @Test
-    void validatesAllRowsButDoesNotApplyAnyWhenOneRowIsInvalid() {
+    void savesRowsWithParsingErrorsForAsyncValidation() {
         UUID accountId = UUID.randomUUID();
         MockMultipartFile file = new MockMultipartFile("file", "readings.csv", "text/csv", (
                 "meter_serial_number,measured_at,zone_t1,zone_t2,zone_t3\n" +
                 "SN-1,2026-09-03T06:00:00Z,100.5,,\n" +
                 "UNKNOWN,2026-09-03T07:00:00Z,110.5,,\n").getBytes());
-        ElectricityMeter meter = mock(ElectricityMeter.class);
         when(accountRepository.findById(accountId)).thenReturn(Optional.of(account()));
         when(importRepository.save(any())).thenAnswer(invocation -> invocation.getArgument(0));
-        when(meterRepository.findBySerialNumber("SN-1")).thenReturn(Optional.of(meter));
 
         ReadingImportResponse response = service.importReadings(file, accountId);
 
-        assertThat(response.status()).isEqualTo(ReadingImportStatus.INVALID);
+        assertThat(response.status()).isEqualTo(ReadingImportStatus.UPLOADED);
         assertThat(response.totalRows()).isEqualTo(2);
-        assertThat(response.validRows()).isEqualTo(1);
-        assertThat(response.invalidRows()).isEqualTo(1);
+        assertThat(response.validRows()).isZero();
+        assertThat(response.invalidRows()).isZero();
         verify(readingRepository, never()).saveAllAndFlush(any());
     }
 
